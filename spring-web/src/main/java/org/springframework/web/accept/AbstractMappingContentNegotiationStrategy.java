@@ -18,6 +18,7 @@ package org.springframework.web.accept;
 
 import java.util.Collections;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 
@@ -43,8 +44,10 @@ import org.springframework.web.context.request.NativeWebRequest;
  * <p>The method {@link #handleNoMatch} allow subclasses to plug in additional
  * ways of looking up media types (e.g. through the Java Activation framework,
  * or {@link jakarta.servlet.ServletContext#getMimeType}). Media types resolved
- * via base classes are then added to the base class
+ * this way for a simple key (i.e. a single file extension without a '.') are
+ * then added, with the key in lower case, to the base class
  * {@link MappingMediaTypeFileExtensionResolver}, i.e. cached for new lookups.
+ * Keys containing a '.' are resolved but not cached.
  *
  * @author Rossen Stoyanchev
  * @since 3.2
@@ -118,7 +121,12 @@ public abstract class AbstractMappingContentNegotiationStrategy extends MappingM
 			}
 			mediaType = handleNoMatch(webRequest, key);
 			if (mediaType != null) {
-				addMapping(key, mediaType);
+				// Only cache simple extensions (bounded by the known media type mappings);
+				// keys containing '.' are resolved by their last segment only and are not cached.
+				String extension = key.toLowerCase(Locale.ROOT);
+				if (extension.indexOf('.') == -1) {
+					addMapping(extension, mediaType);
+				}
 				return Collections.singletonList(mediaType);
 			}
 		}
@@ -144,7 +152,8 @@ public abstract class AbstractMappingContentNegotiationStrategy extends MappingM
 	 * Override to provide handling when a key is not resolved via.
 	 * {@link #lookupMediaType}. Subclasses can take further steps to
 	 * determine the media type(s). If a MediaType is returned from
-	 * this method it will be added to the cache in the base class.
+	 * this method for a simple key (i.e. without a '.'), it will be added,
+	 * with the key in lower case, to the cache in the base class.
 	 */
 	@Nullable
 	protected MediaType handleNoMatch(NativeWebRequest request, String key)
