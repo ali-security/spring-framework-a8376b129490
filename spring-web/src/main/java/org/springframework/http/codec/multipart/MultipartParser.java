@@ -61,8 +61,6 @@ final class MultipartParser extends BaseSubscriber<DataBuffer> {
 
 	private static final byte[] TWO_HYPHENS = {HYPHEN, HYPHEN};
 
-	private static final String HEADER_ENTRY_SEPARATOR = "\\r\\n";
-
 	private static final Log logger = LogFactory.getLog(MultipartParser.class);
 
 	private final AtomicReference<State> state;
@@ -194,6 +192,30 @@ final class MultipartParser extends BaseSubscriber<DataBuffer> {
 		}
 	}
 
+	/**
+	 * Return the two ways {@code boundary} may legally be followed, per RFC-2046:
+	 * {@code CR LF}, for an encapsulation boundary, or {@code --}, for the close delimiter.
+	 */
+	private static byte[][] boundaryVariants(byte[] boundary) {
+		return new byte[][] {
+				MultipartUtils.concat(boundary, CR_LF),
+				MultipartUtils.concat(boundary, TWO_HYPHENS)
+		};
+	}
+
+	/**
+	 * Return {@code remainder} prefixed with the first byte of the {@code CR LF}
+	 * or {@code --} that follows a boundary. Used when a
+	 * {@linkplain #boundaryVariants(byte[]) boundary variant} was matched across
+	 * buffers, with that first byte being the last byte of the previous buffer,
+	 * so that the returned remainder starts with the complete two bytes.
+	 */
+	private static DataBuffer prependBoundarySuffixStart(DataBuffer remainder) {
+		byte suffixStart = (remainder.getByte(remainder.readPosition()) == LF ? CR : HYPHEN);
+		DataBuffer prefix = remainder.factory().allocateBuffer(1).write(suffixStart);
+		return remainder.factory().join(List.of(prefix, remainder));
+	}
+
 
 	/**
 	 * Represents the output of {@link #parse(Flux, byte[], int, Charset)}.
@@ -306,8 +328,8 @@ final class MultipartParser extends BaseSubscriber<DataBuffer> {
 
 
 		public PreambleState() {
-			this.firstBoundary = DataBufferUtils.matcher(
-					MultipartUtils.concat(TWO_HYPHENS, MultipartParser.this.boundary));
+			this.firstBoundary = DataBufferUtils.matcher(boundaryVariants(
+					MultipartUtils.concat(TWO_HYPHENS, MultipartParser.this.boundary)));
 		}
 
 		/**
@@ -322,10 +344,14 @@ final class MultipartParser extends BaseSubscriber<DataBuffer> {
 				if (logger.isTraceEnabled()) {
 					logger.trace("First boundary found @" + endIdx + " in " + buf);
 				}
-				DataBuffer preambleBuffer = buf.split(endIdx + 1);
+				// the boundary is followed by CR LF or --, of which only the
+				// last byte is in this buffer if the match spans buffers
+				boolean suffixSpansBuffers = (endIdx == buf.readPosition());
+				DataBuffer preambleBuffer = buf.split(Math.max(endIdx - 1, buf.readPosition()));
 				DataBufferUtils.release(preambleBuffer);
 
-				changeState(this, new HeadersState(), buf);
+				changeState(this, new HeadersState(),
+						(suffixSpansBuffers ? prependBoundarySuffixStart(buf) : buf));
 			}
 			else {
 				DataBufferUtils.release(buf);
@@ -393,8 +419,16 @@ final class MultipartParser extends BaseSubscriber<DataBuffer> {
 				if (belowMaxHeaderSize(count)) {
 					DataBuffer headerBuf = buf.split(endIdx + 1);
 					this.buffers.add(headerBuf);
-					emitHeaders(parseHeaders());
-
+					HttpHeaders headers;
+					try {
+						headers = parseHeaders();
+					}
+					catch (DecodingException ex) {
+						emitError(ex);
+						changeState(this, DisposedState.INSTANCE, buf);
+						return;
+					}
+					emitHeaders(headers);
 					changeState(this, new BodyState(), buf);
 				}
 				else {
@@ -446,8 +480,7 @@ final class MultipartParser extends BaseSubscriber<DataBuffer> {
 
 		/**
 		 * Parses the list of buffers into a {@link HttpHeaders} instance.
-		 * Converts the joined buffers into a string using ISO=8859-1, and parses
-		 * that string into key and values.
+		 * @throws DecodingException if the headers are malformed
 		 */
 		private HttpHeaders parseHeaders() {
 			if (this.buffers.isEmpty()) {
@@ -457,20 +490,56 @@ final class MultipartParser extends BaseSubscriber<DataBuffer> {
 			this.buffers.clear();
 			String string = joined.toString(MultipartParser.this.headersCharset);
 			DataBufferUtils.release(joined);
-			String[] lines = string.split(HEADER_ENTRY_SEPARATOR);
+
 			HttpHeaders result = new HttpHeaders();
-			for (String line : lines) {
-				int idx = line.indexOf(':');
-				if (idx != -1) {
-					String name = line.substring(0, idx);
-					String value = line.substring(idx + 1);
-					while (value.startsWith(" ")) {
-						value = value.substring(1);
+			int length = string.length();
+			int lineStart = 0;
+			for (int i = 0; i < length; i++) {
+				char c = string.charAt(i);
+				if (c == LF) {
+					if (i == lineStart || string.charAt(i - 1) != CR) {
+						throw new DecodingException("Invalid header: line contains a bare LF");
 					}
-					result.add(name, value);
+					parseHeaderLine(result, string, lineStart, i - 1);
+					lineStart = i + 1;
+				}
+				else if (c == CR && (i + 1 == length || string.charAt(i + 1) != LF)) {
+					throw new DecodingException("Invalid header: line contains a bare CR");
 				}
 			}
+			if (lineStart != length) {
+				throw new DecodingException("Invalid header: headers not terminated by CR LF");
+			}
 			return result;
+		}
+
+		/**
+		 * Parses a single header line into a name/value pair added to
+		 * {@code headers}.
+		 */
+		private static void parseHeaderLine(HttpHeaders headers, String string, int start, int end) {
+			if (start == end) {
+				return;
+			}
+			int colonIdx = string.indexOf(':', start);
+			if (colonIdx <= start || colonIdx >= end) {
+				throw new DecodingException(
+						"Invalid header: no name/value separator found in \"" + string.substring(start, end) + "\"");
+			}
+			String name = string.substring(start, colonIdx);
+			int valueStart = colonIdx + 1;
+			while (valueStart < end && isOptionalWhitespace(string.charAt(valueStart))) {
+				valueStart++;
+			}
+			int valueEnd = end;
+			while (valueEnd > valueStart && isOptionalWhitespace(string.charAt(valueEnd - 1))) {
+				valueEnd--;
+			}
+			headers.add(name, string.substring(valueStart, valueEnd));
+		}
+
+		private static boolean isOptionalWhitespace(char c) {
+			return c == ' ' || c == '\t';
 		}
 
 		@Override
@@ -509,7 +578,7 @@ final class MultipartParser extends BaseSubscriber<DataBuffer> {
 
 		public BodyState() {
 			byte[] delimiter = MultipartUtils.concat(CR_LF, TWO_HYPHENS, MultipartParser.this.boundary);
-			this.boundary = DataBufferUtils.matcher(delimiter);
+			this.boundary = DataBufferUtils.matcher(boundaryVariants(delimiter));
 			this.boundaryLength = delimiter.length;
 		}
 
@@ -525,11 +594,14 @@ final class MultipartParser extends BaseSubscriber<DataBuffer> {
 		public void onNext(DataBuffer buffer) {
 			int endIdx = this.boundary.match(buffer);
 			if (endIdx != -1) {
-				DataBuffer boundaryBuffer = buffer.split(endIdx + 1);
+				// the boundary is followed by CR LF or --, of which only the
+				// last byte is in this buffer if the match spans buffers
+				boolean suffixSpansBuffers = (endIdx == buffer.readPosition());
+				DataBuffer boundaryBuffer = buffer.split(Math.max(endIdx - 1, buffer.readPosition()));
 				if (logger.isTraceEnabled()) {
 					logger.trace("Boundary found @" + endIdx + " in " + buffer);
 				}
-				int len = endIdx - this.boundaryLength + 1 - boundaryBuffer.readPosition();
+				int len = endIdx - this.boundaryLength - 1 - boundaryBuffer.readPosition();
 				if (len > 0) {
 					// whole boundary in buffer.
 					// slice off the body part, and flush
@@ -567,7 +639,8 @@ final class MultipartParser extends BaseSubscriber<DataBuffer> {
 					flush();
 				}
 
-				changeState(this, new HeadersState(), buffer);
+				changeState(this, new HeadersState(),
+						(suffixSpansBuffers ? prependBoundarySuffixStart(buffer) : buffer));
 			}
 			else {
 				enqueue(buffer);
